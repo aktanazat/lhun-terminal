@@ -1,0 +1,140 @@
+#!/bin/sh
+# Sends a notification to the iPad through ntfy when a tmux session rings its bell, or a program in it
+# reports that it waits for him or failed, and nobody is looking at it. Tapping the notification opens
+# Lhûn on that session. tmux's alert-bell hook and lhun-tap (tools/status) run it; setup and how to
+# turn it off are in tools/alerts/README.md.
+#
+#   lhun-alert <session id> <window id>      as the hook passes them, e.g. lhun-alert '$3' '@7'
+#   lhun-alert --pane <pane id>              as lhun-tap passes it, e.g. lhun-alert --pane %4
+#
+# It sends only when no attached client shows the window, or when every attached client has had no
+# input for more than two minutes, and at most once a minute for each session. Control-mode clients,
+# such as Lhûn's own watcher, show nothing, so they count as neither.
+#
+# ~/.config/lhun-alert/env (mode 600, never in git) holds four lines:
+#   url=<ntfy server>  topic=<topic>  token=<ntfy access token>  host=<mac or server, as Lhûn names it>
+# Every send and every skip leaves a line in ~/.local/state/lhun-alert/log.
+
+if [ "$1" = --pane ]; then
+    pane=$2 session='' window=''
+else
+    pane='' session=$1 window=$2
+fi
+settings="$HOME/.config/lhun-alert/env"
+state="$HOME/.local/state/lhun-alert"
+# How long after a client's last input it still counts as someone looking at its window, in seconds.
+idle=120
+# The shortest time between two notifications for one session, in seconds.
+spacing=60
+
+# The hook runs with the tmux server's PATH, which may not reach Homebrew.
+PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+mkdir -p "$state" || exit 0
+log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$state/log"; }
+
+url='' topic='' token='' host=''
+while IFS='=' read -r key value; do
+    case $key in
+        url) url=$value ;;
+        topic) topic=$value ;;
+        token) token=$value ;;
+        host) host=$value ;;
+    esac
+done < "$settings"
+if [ -z "$url" ] || [ -z "$topic" ] || [ -z "$token" ] || [ -z "$host" ]; then
+    log "no url, topic, token or host in $settings"
+    exit 0
+fi
+# A session whose bell-action is none sends nothing for its programs' reports, as tmux sends nothing
+# for its bells.
+if [ -n "$pane" ]; then
+    where=$(tmux display-message -p -t "$pane" '#{session_id} #{window_id} #{bell-action}') || exit 0
+    read -r session window action <<EOF
+$where
+EOF
+    if [ "$action" = none ]; then
+        log "$pane: skipped, its session's bell-action is none"
+        exit 0
+    fi
+fi
+
+# The server's pid keeps sessions of a restarted tmux, which reuses session ids, apart.
+about=$(tmux -u display-message -p -t "$session" '#{pid} #{session_name}') || exit 0
+pid=${about%% *}
+name=${about#* }
+now=$(date +%s)
+
+shown=no
+recent=no
+clients=$(tmux list-clients -F '#{client_control_mode} #{window_id} #{client_activity}')
+while read -r control showing activity; do
+    [ "$control" = 0 ] || continue
+    [ "$showing" = "$window" ] && shown=yes
+    [ $((now - ${activity:-0})) -gt $idle ] || recent=yes
+done <<EOF
+$clients
+EOF
+if [ $shown = yes ] && [ $recent = yes ]; then
+    log "$name: skipped, on screen with someone at it"
+    exit 0
+fi
+
+# A program that reports its status (OSC 7501, tools/status) says what it waits for; its own message
+# stays on the host. Without a report, omp titles its pane "π ! ..." when it asks something or wants
+# approval (Lhun/TmuxWatch.swift).
+statuses=$(tmux list-panes -t "$window" -F '#{@lhun-status}')
+blocked=$(printf '%s\n' "$statuses" | grep -m 1 '^state=blocked:')
+if [ -n "$blocked" ]; then
+    case $blocked in
+        *:kind=permission:*) need="Waiting for approval" ;;
+        *:kind=question:*) need="Waiting for an answer" ;;
+        *:kind=auth:*) need="Waiting for a sign-in" ;;
+        *) need="Waiting on you" ;;
+    esac
+elif printf '%s\n' "$statuses" | grep -q '^state=error:'; then
+    need="Failed"
+elif [ -n "$pane" ]; then
+    log "$name: skipped, nothing waits or failed any more"
+    exit 0
+elif tmux -u list-panes -t "$window" -F '#{pane_title}' | grep -q '^π !'; then
+    need="Waiting for approval"
+else
+    need="Bell"
+fi
+case $host in
+    mac) place="the Mac" ;;
+    *) place="the $host" ;;
+esac
+
+# Two bells that ring together run this twice at once; the lock lets only one of them send.
+stamp="$state/$pid-${session#\$}"
+mkdir "$stamp.lock" 2>/dev/null || exit 0
+trap 'rmdir "$stamp.lock"' EXIT
+trap 'exit 0' HUP INT TERM
+last=$(cat "$stamp" 2>/dev/null)
+if [ $((now - ${last:-0})) -lt $spacing ]; then
+    log "$name: skipped, sent $((now - last))s ago"
+    exit 0
+fi
+
+# curl reads the token from its environment, so it never shows in a process list, and quotes every
+# value for JSON and the link itself.
+status=$(token=$token curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+    --variable %token --variable "topic=$topic" --variable "title=$name" \
+    --variable "message=$need on $place" --variable "host=$host" \
+    --expand-header 'Authorization: Bearer {{token}}' \
+    --expand-data '{"topic":"{{topic:json}}","title":"{{title:json}}","message":"{{message:json}}","click":"lhun://open?host={{host:url}}&session={{title:url}}"}' \
+    "$url/")
+if [ "$status" = 200 ]; then
+    echo "$now" > "$stamp"
+    log "$name: sent \"$need on $place\""
+else
+    log "$name: send failed, HTTP $status"
+fi
+
+# Stamps of sessions long gone, and a log past 256 KB, go.
+find "$state" -name '[0-9]*' -mtime +1 -exec rm -rf {} + 2>/dev/null
+if [ "$(wc -c < "$state/log")" -gt 262144 ]; then
+    tail -n 1000 "$state/log" > "$state/log.new" && mv "$state/log.new" "$state/log"
+fi
+exit 0

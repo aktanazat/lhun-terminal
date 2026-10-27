@@ -1,0 +1,201 @@
+#!/bin/sh
+# lhun: the sessions on this host, for an agent or a script in one of them, and Lhûn's cards for them.
+# `open` asks through the pane option @lhun-open (OpenRequest in Lhun/TmuxWatch.swift); Lhûn clears it once
+# the session is open, and an ask nobody answers within five seconds is withdrawn.
+set -eu
+PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+us=$(printf '\037')
+
+usage() {
+  cat <<'EOF'
+usage: lhun <command> [arguments]
+
+  here                      the session, window, pane and folder this runs in
+  ls                        every session: name, state, program, folder (tab-separated)
+  open [--below] [--dir DIR] [--name NAME] [-- COMMAND...]
+                            show a session beside this one in Lhûn: NAME if it runs, else a new
+                            one in DIR (default here) with COMMAND typed into its shell; prints
+                            its name and whether the user sees it
+  new NAME [--dir DIR] [-- COMMAND...]
+                            start a session out of sight, typing COMMAND into its shell
+  send SESSION TEXT...      type TEXT into SESSION's shown pane and press Return
+  capture SESSION [LINES]   print the last LINES lines of SESSION's shown pane (default 50)
+  wait SESSION [SECONDS]    wait for SESSION's program to finish, fail or ask something
+                            (default 600 s); exits 0 done, 1 failed, 2 asking, 124 timed out
+
+Lhûn opens a session beside the one that asked only while that session's card is on screen, and
+keeps the keyboard where it was. States come from lhun-tap (tools/status in the Lhûn repo):
+working, blocked, done, error, idle, or empty when nothing reports.
+EOF
+}
+
+die() {
+  printf 'lhun: %s\n' "$*" >&2
+  exit 64
+}
+
+inside() {
+  [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ] || die "not inside tmux"
+}
+
+exists() {
+  tmux has-session -t "=$1" 2>/dev/null || die "no session named $1"
+}
+
+field() {
+  printf '%s\n' "$1" | tr ':' '\n' | sed -n "s/^$2=//p"
+}
+
+start() {
+  name=$1 dir=$2
+  shift 2
+  tmux new-session -d -s "$name" -c "$dir"
+  if [ $# -gt 0 ]; then
+    tmux send-keys -t "=$name:" -l -- "$*"
+    tmux send-keys -t "=$name:" Enter
+  fi
+}
+
+# The most urgent state any pane of the session reports, its sequence and its message, "-" for each
+# one missing.
+state_of() {
+  tmux list-panes -s -t "=$1" -F '#{@lhun-status}' | while IFS= read -r summary; do
+    state=$(field "$summary" state)
+    case $state in
+    blocked) rank=4 ;; error) rank=3 ;; working) rank=2 ;; done) rank=1 ;; *) rank=0 ;;
+    esac
+    seq=$(field "$summary" seq)
+    msg=$(field "$summary" msg)
+    printf '%s %s %s %s\n' "$rank" "${state:--}" "${seq:--}" "${msg:--}"
+  done | sort -rn | sed -n '1s/^[0-9]* //p'
+}
+
+[ $# -gt 0 ] || {
+  usage
+  exit 64
+}
+command=$1
+shift
+case $command in
+here)
+  inside
+  tmux display -p -t "$TMUX_PANE" "host=$(uname -n)
+session=#{session_name}
+window=#{window_index}
+pane=#{pane_id}
+folder=#{pane_current_path}"
+  ;;
+ls)
+  tmux list-sessions -F "#{session_name}$us#{pane_current_command}$us#{pane_current_path}" | while IFS=$us read -r name program folder; do
+    state=$(state_of "$name" | cut -d' ' -f1)
+    printf '%s\t%s\t%s\t%s\n' "$name" "${state#-}" "$program" "$folder"
+  done
+  ;;
+open)
+  inside
+  half=right dir=$(tmux display -p -t "$TMUX_PANE" '#{pane_current_path}') name=
+  while [ $# -gt 0 ]; do
+    case $1 in
+    --below) half=below ;;
+    --dir | --name)
+      [ $# -gt 1 ] || die "$1 needs a value"
+      [ "$1" = --dir ] && dir=$2 || name=$2
+      shift
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *) die "unknown option $1" ;;
+    esac
+    shift
+  done
+  if [ -z "$name" ]; then
+    base=$(tmux display -p -t "$TMUX_PANE" '#{session_name}')
+    number=2
+    while tmux has-session -t "=$base-$number" 2>/dev/null; do number=$((number + 1)); done
+    name=$base-$number
+  fi
+  if tmux has-session -t "=$name" 2>/dev/null; then
+    started="already running"
+  else
+    start "$name" "$dir" "$@"
+    started=started
+  fi
+  tmux set-option -p -t "$TMUX_PANE" @lhun-open "$half $TMUX_PANE $name"
+  tries=0
+  while [ $tries -lt 25 ]; do
+    if [ -z "$(tmux show-options -p -v -t "$TMUX_PANE" @lhun-open 2>/dev/null)" ]; then
+      printf '%s: %s, and open beside you in Lhûn\n' "$name" "$started"
+      exit 0
+    fi
+    sleep 0.2
+    tries=$((tries + 1))
+  done
+  tmux set-option -p -u -t "$TMUX_PANE" @lhun-open
+  printf "%s: %s; Lhûn isn't showing this session now, so it waits in the session strip\n" "$name" "$started"
+  ;;
+new)
+  [ $# -gt 0 ] || die "new needs a name"
+  name=$1 dir=$PWD
+  shift
+  if [ "${1:-}" = --dir ]; then
+    [ $# -gt 1 ] || die "--dir needs a folder"
+    dir=$2
+    shift 2
+  fi
+  [ "${1:-}" != -- ] || shift
+  start "$name" "$dir" "$@"
+  printf '%s\n' "$name"
+  ;;
+send)
+  [ $# -gt 1 ] || die "send needs a session and text"
+  exists "$1"
+  session=$1
+  shift
+  tmux send-keys -t "=$session:" -l -- "$*"
+  tmux send-keys -t "=$session:" Enter
+  ;;
+capture)
+  [ $# -gt 0 ] || die "capture needs a session"
+  exists "$1"
+  lines=${2:-50}
+  tmux capture-pane -p -J -t "=$1:" -S "-$lines" |
+    awk -v n="$lines" '{ l[NR] = $0 } END { e = NR; while (e > 0 && l[e] == "") e--; s = e - n + 1; if (s < 1) s = 1; for (i = s; i <= e; i++) print l[i] }'
+  ;;
+wait)
+  [ $# -gt 0 ] || die "wait needs a session"
+  exists "$1"
+  session=$1 limit=${2:-600}
+  start_seq=$(state_of "$session" | cut -d' ' -f2)
+  worked=0 waited=0
+  while :; do
+    set -- $(state_of "$session")
+    state=${1:--} seq=${2:--} msg=${3:--}
+    [ "$state" != working ] || worked=1
+    ended=0
+    case $state in
+    blocked) ended=1 ;;
+    done | error) [ "$seq" = "$start_seq" ] && [ $worked = 0 ] || ended=1 ;;
+    idle) [ $worked = 0 ] || ended=1 ;;
+    esac
+    if [ $ended = 1 ]; then
+      line=$state
+      [ "$msg" = - ] || line="$state: $(printf '%s' "$msg" | base64 -d 2>/dev/null || printf '%s' "$msg" | base64 -D)"
+      printf '%s\n' "$line"
+      case $state in done | idle) exit 0 ;; error) exit 1 ;; *) exit 2 ;; esac
+    fi
+    [ "$waited" -lt "$limit" ] || {
+      [ "$state" = - ] && printf 'nothing reported after %s s\n' "$limit" || printf 'still %s after %s s\n' "$state" "$limit"
+      exit 124
+    }
+    sleep 1
+    waited=$((waited + 1))
+  done
+  ;;
+help | -h | --help) usage ;;
+*)
+  usage >&2
+  exit 64
+  ;;
+esac

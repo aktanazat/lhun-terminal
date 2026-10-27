@@ -1,0 +1,127 @@
+name: Lhun
+options:
+  bundleIdPrefix: com.aktanazat
+  deploymentTarget:
+    iOS: "26.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+packages:
+  # The terminal space and everything under it, with its own pinned dependencies and resources
+  # (Package.swift). The app is a thin shell over it.
+  LhunKit:
+    path: .
+targets:
+  Lhun:
+    type: application
+    platform: iOS
+    sources:
+      - path: LhunApp
+    dependencies:
+      - package: LhunKit
+    info:
+      path: LhunApp/Info.plist
+      properties:
+        CFBundleDisplayName: Lhûn
+        UILaunchScreen:
+          UIColorName: Paper
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        NSLocalNetworkUsageDescription: Lhûn connects to the SSH hosts you pair.
+        # Dictation (Lhun/Dictation.swift): speech becomes text on the device; no audio leaves it.
+        NSMicrophoneUsageDescription: Lhûn listens while you dictate, and types what you say at the cursor.
+        NSSpeechRecognitionUsageDescription: Lhûn turns what you dictate into text on this device. Nothing you say leaves it.
+        # TestFlight's export question. SSH's ciphers come from Apple's CryptoKit (swift-nio-ssh uses
+        # swift-crypto, which is CryptoKit on Apple's systems), so Lhûn adds no encryption of its own.
+        ITSAppUsesNonExemptEncryption: false
+        # The preview loads pages from this device's own loopback, over plain http.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        # lhun://open?host=mac&session=<name> opens a session; the hosts' alert notifications carry one
+        # (tools/alerts).
+        CFBundleURLTypes:
+          - CFBundleURLName: com.aktanazat.lhun
+            CFBundleURLSchemes: [lhun]
+        # A session pill dragged onto the cards (RootView.swift). It conforms to public.item, not
+        # public.data, so the card's drop for pasted files never takes it.
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: com.aktanazat.lhun.session
+            UTTypeDescription: Lhûn session
+            UTTypeConformsTo:
+              - public.item
+          - UTTypeIdentifier: com.aktanazat.lhun.pane-target
+            UTTypeDescription: Lhûn pane target
+            UTTypeConformsTo:
+              - public.item
+        UTImportedTypeDeclarations:
+          - UTTypeIdentifier: com.aktanazat.akyl.task-context
+            UTTypeDescription: Akyl task context
+            UTTypeConformsTo: [public.json]
+            UTTypeTagSpecification:
+              public.filename-extension: [akyltask]
+          - UTTypeIdentifier: com.aktanazat.akyl.task-return
+            UTTypeDescription: Akyl task return
+            UTTypeConformsTo: [public.json]
+            UTTypeTagSpecification:
+              public.filename-extension: [akylreply]
+        LSSupportsOpeningDocumentsInPlace: false
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: Akyl task context
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Alternate
+            LSItemContentTypes: [com.aktanazat.akyl.task-context]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.aktanazat.lhun
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        # iPad first; the same app runs on iPhone.
+        TARGETED_DEVICE_FAMILY: "1,2"
+    scheme:
+      testTargets: [LhunShots]
+  # Unit tests for pure logic, hosted in the app. They use @testable import, which only Debug
+  # builds allow, so they get their own scheme: xcodebuild test -scheme LhunTests.
+  LhunTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: LhunTests
+    dependencies:
+      - target: Lhun
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.aktanazat.lhun.tests
+        GENERATE_INFOPLIST_FILE: YES
+        TARGETED_DEVICE_FAMILY: "1,2"
+    scheme:
+      testTargets: [LhunTests]
+  # Development only: drives the app on a real device against a real tmux session and saves
+  # screenshots (tools/shots.sh). Never part of the shipped app.
+  LhunShots:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: LhunShots
+    dependencies:
+      - target: Lhun
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.aktanazat.lhun.shots
+        GENERATE_INFOPLIST_FILE: YES
+        # Skips XCUITest's wait for the iPad keyboard's animations; see LhunShots/TestBundleSetup.swift.
+        INFOPLIST_KEY_NSPrincipalClass: TestBundleSetup
+        TARGETED_DEVICE_FAMILY: "1,2"

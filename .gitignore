@@ -1,0 +1,10 @@
+Lhun.xcodeproj/
+build/
+DerivedData/
+*.xcresult
+.build/
+.swiftpm/
+.DS_Store
+shots/
+# XcodeGen writes this from project.yml.
+LhunApp/Info.plist

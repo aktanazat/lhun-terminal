@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+"""Keeps this host's tmux sessions across a restart (Lhûn, tools/sessions/README.md).
+
+  lhun-sessions save [--test PREFIX]
+  lhun-sessions restore [--test PREFIX] [--dry-run]
+
+save writes each session's windows (index, name, folder, layout) and each pane's screen with up to
+500 lines of history under ~/.local/state/lhun/sessions. restore recreates every saved session that
+is not running, with its windows and layout, each pane in its old folder showing the saved screen,
+then one dim line and a fresh shell. Programs are not started again, and a running session is never
+touched. Sessions named lhun-test-* are left out; --test PREFIX (which must start with lhun-test-)
+saves and restores only the sessions whose names start with it.
+"""
+
+import fcntl
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.parse
+import uuid
+
+HISTORY = 500
+STATE = os.path.join(os.path.expanduser("~"), ".local", "state", "lhun", "sessions")
+BOOT = os.path.join(STATE, ".boot")
+REPLAY = os.path.join(STATE, ".replay")
+TEST = "lhun-test-"
+SCRIPT = os.path.realpath(__file__)
+# tmux 3.4 writes control characters in list output as octal escapes, so the separator is printable.
+SEP = "\t:lhun:\t"
+MARK = ":lhun-sessions: end of pane :lhun-sessions:"
+# How long a restored pane waits for its layout, and restore for every pane to print.
+WAIT = 10
+FIELDS = [
+    "session_name", "session_created", "window_index", "window_name", "automatic-rename",
+    "window_layout", "window_active", "window_width", "window_height", "pane_index", "pane_id",
+    "pane_current_path", "pane_active",
+]
+# Variables the service manager sets for its own job; a tmux server started from it should not hand
+# them to every shell.
+JOB_VARIABLES = ("INVOCATION_ID", "JOURNAL_STREAM", "SYSTEMD_EXEC_PID", "MANAGERPID", "NOTIFY_SOCKET")
+SGR = re.compile(rb"\x1b\[[0-9;:]*m")
+
+
+def tmux(*args, env=None):
+    return subprocess.run(["tmux", *args], capture_output=True, env=env)
+
+
+def text(data):
+    return data.decode("utf-8", "surrogateescape")
+
+
+def boot_id():
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            return f.read().strip()
+    except OSError:
+        return text(subprocess.run(["sysctl", "-n", "kern.bootsessionuuid"], capture_output=True).stdout).strip()
+
+
+def in_scope(name, prefix):
+    return name.startswith(prefix) if prefix else not name.startswith(TEST)
+
+
+def folder_name(name):
+    return urllib.parse.quote(name, safe="")
+
+
+def write(path, data):
+    """Writes only when the bytes differ, through a rename so a reader never sees half a file."""
+    try:
+        with open(path, "rb") as f:
+            if f.read() == data:
+                return
+    except OSError:
+        pass
+    temporary = path + ".tmp"
+    with open(temporary, "wb") as f:
+        f.write(data)
+    os.replace(temporary, path)
+
+
+def running_panes():
+    """Every pane the tmux server has, or None when no server runs. Never starts one."""
+    result = tmux("list-panes", "-a", "-F", SEP.join("#{%s}" % field for field in FIELDS))
+    if result.returncode != 0:
+        return None
+    rows = []
+    for line in text(result.stdout).splitlines():
+        values = line.split(SEP)
+        if len(values) == len(FIELDS):
+            rows.append(dict(zip(FIELDS, values)))
+    return rows
+
+
+def capture(pane_ids):
+    """Each pane's screen and last lines of history, with colors, in as few tmux calls as possible."""
+    screens = {}
+    remaining = list(pane_ids)
+    while remaining:
+        args = []
+        for pane in remaining:
+            # The marker carries no pane id: display-message reads a % as a time format.
+            args += ["capture-pane", "-p", "-e", "-S", "-%d" % HISTORY, "-t", pane, ";",
+                     "display-message", "-p", MARK, ";"]
+        output = tmux(*args[:-1]).stdout
+        got = 0
+        chunk = []
+        for line in output.split(b"\n"):
+            if line == MARK.encode():
+                screens[remaining[got]] = chunk
+                chunk = []
+                got += 1
+            else:
+                chunk.append(line)
+        # A pane that closed since the listing stops the batch there; skip it and go on.
+        remaining = remaining[got + 1:]
+    for pane, lines in screens.items():
+        while lines and not SGR.sub(b"", lines[-1]).strip():
+            lines.pop()
+        screens[pane] = b"\n".join(lines) + b"\n" if lines else b""
+    return screens
+
+
+def group(rows, prefix):
+    sessions = {}
+    for row in rows:
+        if not in_scope(row["session_name"], prefix):
+            continue
+        session = sessions.setdefault(row["session_name"], {
+            "name": row["session_name"], "created": int(row["session_created"]), "windows": {}})
+        window = session["windows"].setdefault(int(row["window_index"]), {
+            "index": int(row["window_index"]), "name": row["window_name"],
+            "named": row["automatic-rename"] in ("0", "off"), "layout": row["window_layout"],
+            "active": row["window_active"] == "1", "width": int(row["window_width"]),
+            "height": int(row["window_height"]), "panes": []})
+        window["panes"].append({
+            "index": int(row["pane_index"]), "id": row["pane_id"], "folder": row["pane_current_path"],
+            "active": row["pane_active"] == "1"})
+    for session in sessions.values():
+        session["windows"] = sorted(session["windows"].values(), key=lambda w: w["index"])
+        for window in session["windows"]:
+            window["panes"].sort(key=lambda p: p["index"])
+    return sessions
+
+
+def saved_sessions(prefix):
+    sessions = []
+    if not os.path.isdir(STATE):
+        return sessions
+    for entry in os.listdir(STATE):
+        if entry.startswith("."):
+            continue
+        try:
+            with open(os.path.join(STATE, entry, "session.json")) as f:
+                session = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if in_scope(session["name"], prefix):
+            session["folder"] = os.path.join(STATE, entry)
+            sessions.append(session)
+    return sorted(sessions, key=lambda s: (s["created"], s["name"]))
+
+
+def needs_restore():
+    """True after a restart until restore has run: the state was written in an earlier boot."""
+    try:
+        with open(BOOT) as f:
+            return f.read().strip() != boot_id()
+    except OSError:
+        return False
+
+
+def save(prefix):
+    rows = running_panes()
+    # No server, or one with no sessions left: tmux is going away (a restart, a logout). Keep what
+    # was saved, so it can come back.
+    if not rows:
+        return 0
+    if not prefix and needs_restore():
+        restore(None, False)
+        rows = running_panes()
+        if not rows:
+            return 0
+    sessions = group(rows, prefix)
+    screens = capture([pane["id"] for s in sessions.values() for w in s["windows"] for pane in w["panes"]])
+    now = int(time.time())
+    os.makedirs(STATE, exist_ok=True)
+    for session in sessions.values():
+        folder = os.path.join(STATE, folder_name(session["name"]))
+        os.makedirs(folder, exist_ok=True)
+        keep = {"session.json"}
+        for window in session["windows"]:
+            for pane in window["panes"]:
+                pane["file"] = "%d.%d.txt" % (window["index"], pane["index"])
+                keep.add(pane["file"])
+                if pane["id"] in screens:
+                    write(os.path.join(folder, pane["file"]), screens[pane["id"]])
+                del pane["id"]
+        for entry in os.listdir(folder):
+            if entry not in keep:
+                os.remove(os.path.join(folder, entry))
+        session["saved"] = now
+        write(os.path.join(folder, "session.json"), json.dumps(session, indent=1).encode() + b"\n")
+    for session in saved_sessions(prefix):
+        if session["name"] not in sessions:
+            shutil.rmtree(session["folder"])
+    if not prefix:
+        write(BOOT, boot_id().encode() + b"\n")
+    return 0
+
+
+def tmux_env():
+    return {key: value for key, value in os.environ.items() if key not in JOB_VARIABLES}
+
+
+def restore_session(session, server_running):
+    name = session["name"]
+    target = "=" + name
+    env = tmux_env()
+    replays = []
+
+    def command(window, pane):
+        source = os.path.join(session["folder"], pane["file"])
+        replay = os.path.join(REPLAY, uuid.uuid4().hex)
+        try:
+            shutil.copyfile(source, replay)
+        except OSError:
+            write(replay, b"")
+        channel = "lhun-restore-" + os.path.basename(replay)
+        replays.append(channel)
+        folder = pane["folder"] if os.path.isdir(pane["folder"]) else os.path.expanduser("~")
+        return ["-c", folder, "--", sys.executable, SCRIPT, "replay", replay, channel, str(session["saved"])]
+
+    def run(*args, start=False):
+        argv = ["tmux", *args]
+        # Started by systemd at boot, the tmux server would live in the boot job's group and be
+        # stopped with it; a scope of its own keeps it running.
+        if start and os.environ.get("INVOCATION_ID") and shutil.which("systemd-run"):
+            argv = ["systemd-run", "--scope", "--quiet", "--collect",
+                    "--unit=lhun-tmux-%d" % time.time(), "--description=tmux brought back by lhun-sessions",
+                    *argv]
+        result = subprocess.run(argv, capture_output=True, env=env)
+        if result.returncode != 0:
+            raise RuntimeError("tmux %s: %s" % (args[0], text(result.stderr).strip()))
+        return text(result.stdout).strip()
+
+    os.makedirs(REPLAY, exist_ok=True)
+    windows = session["windows"]
+    first = windows[0]
+    naming = ["-n", first["name"]] if first["named"] else []
+    created = run("new-session", "-d", "-P", "-F", "#{window_index}", "-s", name,
+                  "-x", str(first["width"]), "-y", str(first["height"]), *naming,
+                  *command(first, first["panes"][0]), start=not server_running)
+    if created != str(first["index"]):
+        run("move-window", "-s", "%s:%s" % (target, created), "-t", "%s:%d" % (target, first["index"]))
+    for window in windows:
+        here = "%s:%d" % (target, window["index"])
+        if window is not first:
+            naming = ["-n", window["name"]] if window["named"] else []
+            run("new-window", "-d", "-t", here, *naming, *command(window, window["panes"][0]))
+        last = run("display-message", "-p", "-t", here, "#{pane_id}")
+        for pane in window["panes"][1:]:
+            # Splitting the newest pane keeps the panes in their saved order for the layout.
+            last = run("split-window", "-d", "-P", "-F", "#{pane_id}", "-t", last, *command(window, pane))
+            run("select-layout", "-t", here, "tiled")
+        if subprocess.run(["tmux", "select-layout", "-t", here, window["layout"]], capture_output=True).returncode:
+            print("%s: window %d keeps a tiled layout" % (name, window["index"]), file=sys.stderr)
+        for pane in window["panes"]:
+            if pane["active"]:
+                run("select-pane", "-t", "%s.%d" % (here, pane["index"]))
+        if window["active"]:
+            run("select-window", "-t", here)
+    # new-session -x -y sets the session's default-size; a restored session should size like any other.
+    run("set-option", "-u", "-t", target + ":", "default-size")
+    for channel in replays:
+        run("wait-for", "-S", channel + "-go")
+    deadline = time.time() + WAIT
+    for channel in replays:
+        try:
+            subprocess.run(["tmux", "wait-for", channel + "-done"], timeout=max(0.1, deadline - time.time()))
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def restore(prefix, dry_run):
+    if sys.platform == "darwin" and not prefix and not dry_run:
+        # A tmux server an SSH command starts lives outside the login session and cannot open the
+        # Keychain. Started here, at login, and kept with no sessions, SSH never has to start one.
+        tmux("start-server", ";", "set-option", "-g", "exit-empty", "off")
+    names = tmux("list-sessions", "-F", "#{session_name}")
+    server_running = names.returncode == 0
+    running = set(text(names.stdout).splitlines()) if server_running else set()
+    failed = 0
+    saved = saved_sessions(prefix)
+    if dry_run:
+        print("%d saved under %s" % (len(saved), STATE))
+    else:
+        # A pane closed before it printed leaves its copy behind.
+        for entry in os.listdir(REPLAY) if os.path.isdir(REPLAY) else []:
+            path = os.path.join(REPLAY, entry)
+            if os.path.getmtime(path) < time.time() - 3600:
+                os.remove(path)
+    for session in saved:
+        windows = len(session["windows"])
+        panes = sum(len(w["panes"]) for w in session["windows"])
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(session["saved"]))
+        if session["name"] in running:
+            if dry_run:
+                print("running, left alone: %s" % session["name"])
+            continue
+        if dry_run:
+            print("would restore: %s (%d windows, %d panes, saved %s)" % (session["name"], windows, panes, when))
+            continue
+        try:
+            restore_session(session, server_running)
+            server_running = True
+            print("restored %s: %d windows, %d panes, saved %s" % (session["name"], windows, panes, when))
+        except RuntimeError as error:
+            failed += 1
+            print("%s: %s" % (session["name"], error), file=sys.stderr)
+    if not prefix and not dry_run:
+        os.makedirs(STATE, exist_ok=True)
+        write(BOOT, boot_id().encode() + b"\n")
+    return 1 if failed else 0
+
+
+def replay(path, channel, saved):
+    """Runs in a restored pane: prints the saved screen once the layout is set, then becomes a shell."""
+    try:
+        subprocess.run(["tmux", "wait-for", channel + "-go"], timeout=WAIT)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        os.remove(path)
+    except OSError:
+        data = b""
+    stamp = time.localtime(int(saved))
+    when = time.strftime("%H:%M" if stamp[:3] == time.localtime()[:3] else "%b %d %H:%M", stamp)
+    out = sys.stdout.buffer
+    out.write(data)
+    out.write(b"\x1b[0m\x1b[2mrestored after restart, screen saved at %s\x1b[0m\n" % when.encode())
+    out.flush()
+    subprocess.run(["tmux", "wait-for", "-S", channel + "-done"], capture_output=True)
+    shell = text(tmux("show-options", "-gv", "default-shell").stdout).strip()
+    if not os.access(shell, os.X_OK):
+        shell = os.environ.get("SHELL") or "/bin/sh"
+    os.execv(shell, ["-" + os.path.basename(shell)])
+
+
+class Lock:
+    def __init__(self, name):
+        os.makedirs(STATE, exist_ok=True)
+        self.file = open(os.path.join(STATE, name), "a")
+
+    def take(self, wait=True):
+        try:
+            fcntl.flock(self.file, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+            return True
+        except BlockingIOError:
+            return False
+
+    def give(self):
+        fcntl.flock(self.file, fcntl.LOCK_UN)
+
+
+def main(argv):
+    if argv[:1] == ["replay"] and len(argv) == 4:
+        replay(*argv[1:])
+        return 0
+    command, rest = (argv[0], argv[1:]) if argv else ("", [])
+    prefix = None
+    dry_run = False
+    while rest:
+        if rest[0] == "--test" and len(rest) > 1 and rest[1].startswith(TEST):
+            prefix, rest = rest[1], rest[2:]
+        elif rest[0] == "--dry-run" and command == "restore":
+            dry_run, rest = True, rest[1:]
+        else:
+            command = ""
+            break
+    if command not in ("save", "restore"):
+        print(__doc__.strip().split("\n\n")[1], file=sys.stderr)
+        return 64
+    if dry_run:
+        return restore(prefix, True)
+    running = Lock(".running")
+    if command == "save":
+        # Hooks fire in bursts. One save waiting behind the running one sees every change made
+        # before it starts, so a third has nothing to add. A save of test sessions waits apart.
+        pending = Lock(".pending" + ("-" + prefix if prefix else ""))
+        if not pending.take(wait=False):
+            return 0
+        running.take()
+        pending.give()
+        return save(prefix)
+    running.take()
+    return restore(prefix, False)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
