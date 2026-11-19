@@ -30,8 +30,8 @@ class Fixture:
     def __init__(self, root):
         self.root = root
         self.user = pwd.getpwuid(os.getuid()).pw_name
-        self.sshd = shutil.which("sshd")
-        self.tmux = shutil.which("tmux")
+        self.sshd = os.path.abspath(shutil.which("sshd"))
+        self.tmux = os.path.abspath(shutil.which("tmux"))
         self.home = root / "home"
         self.home.mkdir()
         self.env = {
