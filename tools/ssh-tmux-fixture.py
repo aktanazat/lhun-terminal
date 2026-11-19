@@ -2,7 +2,7 @@
 """A disposable, loopback-only SSH host for Lhûn's simulator and host-tool tests."""
 
 import argparse
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 import os
 from pathlib import Path
 import pwd
@@ -236,7 +236,23 @@ def check(fixture):
     print("PASS: lhun-sessions restores the saved screen and excludes sessions outside the test prefix")
 
 
-def serve(fixture):
+@contextmanager
+def running_fixture(authorized_key):
+    with tempfile.TemporaryDirectory(prefix="lhun-fixture-", dir="/tmp") as directory:
+        fixture = Fixture(Path(directory))
+        try:
+            fixture.start(authorized_key)
+            yield fixture
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            log = fixture.root / "sshd.log"
+            if log.exists():
+                print(log.read_text(), end="", file=sys.stderr)
+            sys.exit(f"Fixture failed: {error}")
+        finally:
+            fixture.close()
+
+
+def serve(authorized_key):
     # Signal handlers set flags only; socket operations happen back in the main loop.
     stopped = drop = False
 
@@ -251,16 +267,19 @@ def serve(fixture):
     signal.signal(signal.SIGTERM, stop_handler)
     signal.signal(signal.SIGINT, stop_handler)
     signal.signal(signal.SIGUSR1, drop_handler)
-    print(f"SSH:  {shlex.join(fixture.ssh('fixture'))}")
-    print(f"Pair: {fixture.pairing_url()}")
-    print(f"Drop: kill -USR1 {os.getpid()}", flush=True)
-    while not stopped and fixture.thread.is_alive():
-        if drop:
-            drop = False
-            fixture.drop_connections()
-        time.sleep(0.1)
-    if not stopped:
-        raise RuntimeError("SSH listener stopped unexpectedly")
+    with running_fixture(authorized_key) as fixture:
+        if stopped:
+            return
+        print(f"SSH:  {shlex.join(fixture.ssh('fixture'))}")
+        print(f"Pair: {fixture.pairing_url()}")
+        print(f"Drop: kill -USR1 {os.getpid()}", flush=True)
+        while not stopped and fixture.thread.is_alive():
+            if drop:
+                drop = False
+                fixture.drop_connections()
+            time.sleep(0.1)
+        if not stopped:
+            raise RuntimeError("SSH listener stopped unexpectedly")
 
 
 def main():
@@ -274,18 +293,11 @@ def main():
     for command in ("ssh", "sshd", "ssh-keygen", "tmux"):
         if not shutil.which(command):
             parser.error(f"{command} must be on PATH")
-    with tempfile.TemporaryDirectory(prefix="lhun-fixture-", dir="/tmp") as directory:
-        fixture = Fixture(Path(directory))
-        try:
-            fixture.start(args.authorize)
-            (check if args.mode == "check" else serve)(fixture)
-        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
-            log = fixture.root / "sshd.log"
-            if log.exists():
-                print(log.read_text(), end="", file=sys.stderr)
-            sys.exit(f"Fixture failed: {error}")
-        finally:
-            fixture.close()
+    if args.mode == "serve":
+        serve(args.authorize)
+    else:
+        with running_fixture(args.authorize) as fixture:
+            check(fixture)
 
 
 if __name__ == "__main__":
