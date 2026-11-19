@@ -99,6 +99,24 @@ xcodebuild -project Lhun.xcodeproj -scheme LhunTests \
 
 `LhunShots` contains development UI probes and real-host terminal scenarios, including nested and floating cards, retained-history search, prompt navigation and saved keyboard bindings. These need a deliberately configured SSH/tmux fixture and may create or kill test-prefixed sessions. The split suite requires `SPLIT_PREFIX`; the retained-history suite uses `lhun-rex-history`, retained rows and real OSC 133 prompt marks. Do not point them at an account whose test sessions you want to keep. A successful build or unit suite alone does not verify SSH pairing, reconnection, hardware keyboard input, Secure Enclave behavior or physical two-app document delivery.
 
+For SSH and session-tool tests on macOS, use the disposable loopback fixture (Python 3.9+, OpenSSH including `sshd`, and tmux on `PATH`; no root or Remote Login needed):
+
+```sh
+python3 tools/ssh-tmux-fixture.py check
+python3 tools/ssh-tmux-fixture.py serve
+```
+
+`check` exercises pinned SSH, a forced disconnect during a tmux attach, and `lhun-sessions` save and restore. It does not run Lhûn. `serve` prints an SSH command and a `kill -USR1` command: use the latter to drop all current fixture connections while leaving the listener and tmux sessions running. Use `lhun-test-fixture-shell` as the attach target, or create other test sessions over the printed SSH connection. It uses its own keys, home and tmux socket, and removes them on normal shutdown (Control-C or SIGTERM). Commands still run as the local user; this is not a sandbox.
+
+To use the fixture with Lhûn, launch the Debug app on a disposable simulator and open its pairing sheet to generate the simulator's public key. Set `UDID` to that simulator's ID:
+
+```sh
+data=$(xcrun simctl get_app_container "$UDID" com.aktanazat.lhun data)
+python3 tools/ssh-tmux-fixture.py serve --authorize "$data/Library/Application Support/simulator/key.pub"
+```
+
+In another terminal, use `xcrun simctl openurl "$UDID" 'PAIR_URL'` with the printed pairing URL, then confirm the new **Server** pairing in the app. The fixture is only accessible from the Mac running it and its simulator. Existing probes that directly use the default tmux socket or require extra seed data are not automatically redirected.
+
 Lhûn is not a general saved-host manager: it currently has only the Mac and Server places. It supports public-key SSH, not passwords, SSH agents, arbitrary SSH config files or automatic host provisioning. On-device speech recognition depends on the device and language. Remote session content and selected files are held locally as required by the app's features; the privacy manifest is in `Lhun/PrivacyInfo.xcprivacy`.
 
 The 20 bundled fonts are byte-identical to the corresponding files in [Monaspace 1.400](https://github.com/githubnext/monaspace/tree/v1.400/fonts), under the included [SIL OFL 1.1](Lhun/Fonts/OFL.txt). The wave app icon is generated geometrically by `tools/make-icon.swift`. Program and model glyphs are requested through Apple's system APIs; no third-party logo pack or copied character is bundled. See [artwork and font notices](Lhun/ProgramIcons-LICENSE.md). Dependencies are fetched from their upstream repositories rather than copied into this source snapshot.
