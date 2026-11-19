@@ -85,7 +85,7 @@ Inspect installation scripts before running them. Host helpers can change that h
 
 The source also contains Lhûn's side of an Akyl document handoff. An `.akyltask` document supplies a frozen context snapshot and points at an existing terminal session. Lhûn can prepare an `.akylreply` document and show the native Open In menu for a receiving app. These files do not include Akyl's task store, PDF reader, task/draft authority or separate application. The originating app must be installed and support the document contract for the two-app round trip. No standalone simulator check proves that physical-device handoff; it remains an owner-only two-app check. Reconnect and returning to an Akyl task do not automatically send selected text.
 
-In Files, use **Share → Lhûn** to open an `.akyltask` document. The tested simulator did not list Lhûn under **Open With**.
+In Files, touch and hold an `.akyltask` document and choose **Open With → Lhûn**, or use **Share → Lhûn**. Open With was verified on an iOS 26.5 simulator. Lhûn reads a snapshot of the original provider document without editing it; its document registration enables opening in place so Files can offer it under Open With.
 
 ## Checks and limits
 

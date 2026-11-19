@@ -3,6 +3,21 @@ import Testing
 @testable import LhunKit
 
 struct AkylDocumentTests {
+    @Test("The app registers Akyl context documents for Files Open With")
+    func filesDocumentRegistration() throws {
+        let info = try #require(Bundle.main.infoDictionary)
+        #expect(info["LSSupportsOpeningDocumentsInPlace"] as? Bool == true)
+        let documents = try #require(info["CFBundleDocumentTypes"] as? [[String: Any]])
+        #expect(documents.contains {
+            ($0["LSItemContentTypes"] as? [String])?.contains(AkylDocument.contextType) == true
+                && $0["CFBundleTypeRole"] as? String == "Viewer"
+        })
+        let types = try #require(info["UTImportedTypeDeclarations"] as? [[String: Any]])
+        let context = try #require(types.first { $0["UTTypeIdentifier"] as? String == AkylDocument.contextType })
+        let tags = try #require(context["UTTypeTagSpecification"] as? [String: Any])
+        #expect(tags["public.filename-extension"] as? [String] == ["akyltask"])
+    }
+
     private static let token = "00000000-0000-4000-8000-000000000001"
     private static let open = """
     {"version":1,"token":"\(token)","task":"fixture-task","taskTitle":"Original task",

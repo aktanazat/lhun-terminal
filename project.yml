@@ -78,7 +78,7 @@ targets:
             UTTypeConformsTo: [public.json]
             UTTypeTagSpecification:
               public.filename-extension: [akylreply]
-        LSSupportsOpeningDocumentsInPlace: false
+        LSSupportsOpeningDocumentsInPlace: true
         CFBundleDocumentTypes:
           - CFBundleTypeName: Akyl task context
             CFBundleTypeRole: Viewer
